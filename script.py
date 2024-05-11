@@ -1,34 +1,12 @@
 import glob
 import time
+import numpy as np
 import pandas as pd
+from multiprocessing import Process, freeze_support
 
 SOCIAL_TIES_PATH = 'social_ties/LFM-1b_social_ties.txt'
 USERS_PATH = 'runs/'
-DESTINATION_PATH = 'files/'
-
-def relations_bt_users(user1, users):
-    same_track = []
-
-    for user2 in users:
-        df_user1 = pd.merge(user1[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user2[['track_id']], on='track_id', how='inner')
-        df_user2 = pd.merge(user2[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user1[['track_id']], on='track_id', how='inner')
-
-        same_track.append(df_user1)
-        same_track.append(df_user2)
-
-        df_user1 = pd.merge(user1[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user2[['artist_id']], on='artist_id', how='inner')
-        df_user2 = pd.merge(user2[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user1[['artist_id']], on='artist_id', how='inner')
-
-        same_track.append(df_user1)
-        same_track.append(df_user2)
-
-        df_user1 = pd.merge(user1[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user2[['album_id']], on='album_id', how='inner')
-        df_user2 = pd.merge(user2[['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']], user1[['album_id']], on='album_id', how='inner')
-
-        same_track.append(df_user1)
-        same_track.append(df_user2)
-
-    return pd.concat(same_track).drop_duplicates().sort_values(by='timestamp')
+DESTINATION_PATH = 'files_multi/'
 
 def read_users_file(users):
     users_files = []
@@ -40,13 +18,25 @@ def read_users_file(users):
     return users_files
 
 def find_user_relations(user_id, social_ties):
-    relations = [] 
+    relations = []
 
-    for tie in social_ties:
-      if (tie[0] == user_id):
-        relations.append(tie[1])
+    relations.extend(social_ties.loc[social_ties['user1'] == user_id, 'user2'])
 
     return relations
+
+def load_all_user_files(path): 
+    dfs = []
+    files = glob.glob(path + '*.txt')
+
+    for file in files:
+        df = pd.read_csv(file, sep='\t')
+        df.columns = ['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']
+        dfs.append(df)
+
+    merged_files = pd.concat(dfs)
+    merged_files.columns = ['user_id', 'artist_id', 'album_id', 'track_id', 'timestamp']
+
+    return merged_files.sort_values(by='user_id')
 
 def read_user_file(filename):
     user = []
@@ -61,32 +51,16 @@ def read_user_file(filename):
     
     return pd.concat(user)
 
-def get_ids(matrix): 
-    ids = []
-    for line in matrix:
-        ids.append(line[0])
-    return set(ids)
+def get_unique_ids(social_ties):
+    all_ids = pd.concat([social_ties['user1'], social_ties['user2']])
+    all_ids = all_ids.rename('id')
+    unique_ids = all_ids.drop_duplicates()
+    return unique_ids
 
 def read_social_ties(filename):
-    matrix = []
-
-    with open(filename, 'r') as arquivo:
-        lines = arquivo.readlines()
-
-        for line in lines:
-            if(not line):
-               continue
-
-            colunas = line.strip().split("\t")
-
-            try: 
-                user_ids = [colunas[0], colunas[1]]
-            except Exception as e: 
-                colunas = line.strip().split(" ")
-                user_ids = [colunas[0], colunas[1]]
-            matrix.append(user_ids)
-
-    return matrix
+    data = pd.read_csv(filename, sep='\t', header=None, skiprows=1, dtype=str, engine='python')
+    data.columns = ['user1', 'user2']
+    return data
 
 def create_user_file(user_id, social_ties):
     relations = find_user_relations(user_id, social_ties)
@@ -108,26 +82,76 @@ def create_user_file(user_id, social_ties):
     if len(relations_info) == 0:
         return
     
-    tracks = relations_bt_users(user_info, relations_info)
+    relations_info.append(user_info)
 
-    if(tracks.empty):
-        return
-    
+    combined_df = pd.concat(relations_info, ignore_index=True)
+
+    sorted_df = combined_df.sort_values(by='timestamp')
+
     filename = DESTINATION_PATH + user_id + '.txt'
 
-    tracks.to_csv(filename, sep='\t', index=False)
-    
+    sorted_df.to_csv(filename, sep='\t', index=False)
+
+def divide_ids(ids):
+    len_shape = len(ids) // 4 # 4 Threads
+    shapes = []
+    start = 0
+
+    for i in range(4):
+        if i == 3:
+            shapes.append(ids[start:])
+        else:
+            shapes.append(ids[start:start+len_shape])
+            start += len_shape
+
+    return shapes
+
+def divide(ids):
+    N_PROC = 4
+    SIZE = ids.size
+    lenght = np.int64(np.ceil(SIZE / N_PROC))
+    shares = [i * lenght for i in range(N_PROC)]
+    index_slices = []
+    for i in range(N_PROC):
+        if i < N_PROC-1:
+            arr=ids[shares[i]:shares[i+1]]
+            if arr.size != 0:
+                index_slices.append(arr)
+        else:
+            arr=ids[shares[i]:]
+            if arr.size != 0:
+                index_slices.append(arr)
+
+def merge_shape(social_ties, ids):
+    for id in ids:
+        create_user_file(id, social_ties)
+
+def multiprocessing(social_ties, index_slices):
+    block = []
+
+    for slices in index_slices:
+        freeze_support()
+        blk = Process(target=merge_shape, args=(social_ties, slices,))
+        blk.start()
+        print('%d,%s' % (blk.pid, " starting..."))
+        block.append(blk)
+
+    for blk in block:
+        print('%d,%s' % (blk.pid, " waiting..."))
+        blk.join()
 
 def merge_all():
     # Grava o tempo inicial
     inicio = time.time()
     
     social_ties = read_social_ties(SOCIAL_TIES_PATH)
-    ids = get_ids(social_ties)
 
-    for id in ids:
-        create_user_file(id, social_ties)
+    ids = get_unique_ids(social_ties)
 
+    shapes = divide_ids(ids)
+
+    multiprocessing(social_ties, shapes)
+     
     fim = time.time()
 
     # Calcula o tempo total decorrido
@@ -135,4 +159,5 @@ def merge_all():
 
     print(f"Tempo de execução: {tempo_total} segundos")
 
-merge_all()
+if __name__ == '__main__':
+    merge_all()
